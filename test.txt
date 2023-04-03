@@ -1,7 +1,933 @@
-test
-aaaaaaaaaaaaaaa
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Burst;
+[RequireComponent(typeof(ESCheckForCrashState))]
+[BurstCompile]
+public class ESVehicleAI : MonoBehaviour
+{
+    public enum TargetUpdateMethod
+    {
+        ByLateUpdate,
+        ByUpdateOnly,
+        ByFixedOnly
+    }
+
+    [Header("Version 2.0.0F")]
+    public TargetUpdateMethod GetTargetUpdateMethod = TargetUpdateMethod.ByLateUpdate;
+
+    public Transform TargetNode;
+    [Header("WheelSettings")]
+    public WheelCollider[] frontwheel;
+    public WheelCollider[] rearwheel;
+    public Transform[] frontwheelmeshes;
+    public Transform[] rearwheelmeshes;
+    //
+    [HideInInspector] //质量1000，drag为0.5，EngineTorque为300时，稳定时速约为30km/h
+    public float EngineTorque, BrakeDrag;
+
+    //
+    //
+    [Header("AI Settings")]
+    public Vector3 CenterOfMass = Vector3.zero;
+    public float SteerBalanceFactor = 0.5f;
+    public float SharpAngleSpeed = 11;
+    public float topspeed = 50.0f;
+
+    public float SharpBendSpeed = 30f;
+    [Tooltip ("当player物体距离发射器大于该值，则发射物体全部钝化")]
+    public float SpawnDistance = 400f;
+    [HideInInspector] public Transform player;
+    //
+    [Header("AISensorSettings")]
+    [Tooltip("当来车距离小于等于该值范围则躲避")]
+    public float DangerZone = 50f;
+    public float sidesensor = 5f;
+    public float fowardsensor = 5.5f;
+    [Tooltip("wont make attempt to avoid")]
+    public bool IgnoreOverTake = true;
+    [Tooltip("EnableAvoidance")]
+    public bool UseSmartAvoidMethod = true;
+    public float OvertakeMultiplier = 200f, Rspeed = 1.5f;
+    public bool DisableDetection = true;
+    [Range(2, 10)]
+    public float Rdistance = 7f;
+    [Range(0.15f, 2f)]
+    public float Ai_VehicleWidth = .25f, Ai_VehicleOverTakeWidth = 0.71f;
+    [Range(10f, 30)]
+    public float Ai_OvertakeSteerSensitivity = 15f, AvoidDistance = 15f;
+
+    public float overtakedistance = 15f;
+    private float hitsidedis;
+    private float hitfwd;
+    [Tooltip ("刹车距离")]
+    [Range(0, 15)] public float RealseBrakeDistance = 15f;
+    //public bool Box2Isavoiding = false;
+    //
+    [Header("PathSettings")]
+    [Tooltip ("切换下一目标节点最短距离")]
+    public float DistanceApart = 10f;
+    //
+    [Header("Debug")]
+    public Rigidbody CarRb;
+    [Tooltip("ReadOnly")] public float currentspeed;
+    [Tooltip("ReadOnly")] public float Brakemul;
+    //[Tooltip("ReadOnly")] public bool IsBraking;
+    [Tooltip("ReadOnly")] public float backuptopspeed;
+    //[HideInInspector]
+    public  float distToTriggerobject, steerang;//记录碰撞物体与本车的距离以及前轮转向角
+    //[HideInInspector]
 
 
-edit by master
-edit by hottxt
-hhhhhhhhhhhhhhhh
+    private float nearestColliderSide;//记录最近的可能碰撞体的前方距离
+
+
+
+
+
+
+
+    //[HideInInspector]
+    public bool returnmotor;
+    [HideInInspector]
+
+    public float RoadWidth = 4f;
+    [HideInInspector]
+    public bool Stop;
+    [HideInInspector]
+    public bool DisableSmartAI = false;
+    public bool callsensor = false;
+    [HideInInspector]
+    public ESTrafficLghtCtrl trafficlightctrl;
+    [HideInInspector]
+    public Transform TriggerObject, prevouisOvertakedObject;//TriggerObject为与之碰撞的其他车辆
+    [HideInInspector]
+    public float TriggerDistance;
+    [HideInInspector]
+    public float backupdistapart;
+    [HideInInspector]
+    public bool AngleBraking = false;
+    public bool CopySpeed;
+
+    [HideInInspector]
+    public bool Trafficlightbraking = false;
+    [HideInInspector]
+    public bool returntriggerstay = false,  optimizerandom = true, Reverse, Hasreversed, dontalterspeed;
+    //[HideInInspector]
+    public bool triggerobjectbraking = false;
+    [HideInInspector]
+    public float distToTargetNode;
+    [HideInInspector] public Vector3 relativevec;
+    [HideInInspector] public float newsteer;
+    [HideInInspector]
+    public float fwddot, side, playerdist, steersign;
+    [HideInInspector]
+    public bool EnableAvoid = true, alignwithroad, manuever;
+    [HideInInspector] public bool isovertaking, IndividualTracker = true;
+    private float OldRot;
+    [HideInInspector]
+    public Vector3 Tar, RelativePoint;
+    //
+    public List<Collider> pedestrianCollider = new List<Collider>();
+    public List<Collider> vehicleCollider =new List<Collider>();
+    public float Speedmodifier = 100, backdrag, backengine;
+    [HideInInspector] public float turnspeed;
+    float Vsign, updatedistback;
+    GameObject TargetHolder;
+    bool Tooclose;
+    public float maxVehicleSpeed; //记录到达路口最高时速
+    public float vehicleVelocity;//记录车辆当前速度
+    public bool ifWillCrash;
+    public int selfPriority;
+
+    //public float a1,a2;
+    //
+    private void Awake()
+    {
+        // runs before game starts
+        EnableAvoid = false;
+        backuptopspeed = topspeed;
+        Speedmodifier = 100f;
+        player = GameObject.FindGameObjectWithTag("Player").transform;
+        IndividualTracker = true;
+
+    }
+    //
+    private void Start()
+    {
+        //runs as soon as game starts
+       EngineTorque=maxVehicleSpeed *10;//扭矩和最高时速大致呈10倍关系
+       BrakeDrag=10f;
+       updatedistback = DistanceApart;
+       steersign = 0;
+        pedestrianCollider = new List<Collider>();
+        vehicleCollider = new List<Collider>();
+        backuptopspeed = topspeed;
+        CarRb = this.GetComponent<Rigidbody>();
+        backdrag = CarRb.angularDrag;
+        CarRb.centerOfMass += CenterOfMass;
+        backengine = EngineTorque;
+        //IsBraking = false;
+        backupdistapart = DistanceApart;
+        CarRb.solverIterations = 10;
+
+
+        
+    }
+    // Update is called once per frame
+    //
+    private void VehicleUpdate()
+    {
+        /*
+            this contains all functions that moves the AI vehicle
+        */
+        Motor(); //给车轮加力矩
+        SteerBalance(); //设置车轮转向参数
+        ApplySteer();  //实现车轮转向
+        Behaviour();   //交通灯控制行为
+        WheelAlignment();//让车轮轮胎跟上车轮位置
+        RegulateAI();
+    }
+    //
+    private void Update()
+    {
+        vehicleVelocity = CarRb.velocity.magnitude;
+        //
+        if (GetTargetUpdateMethod == TargetUpdateMethod.ByLateUpdate) return;
+
+        CheckDist();//检查车辆到下一节点的距离
+        UpdateIndividually();//检查路径是否跑完，跑完则钝化
+        VehicleUpdate();
+        
+
+    }
+    //
+  
+    private void Motor()
+    {
+        
+        if (returnmotor)//returnMotor为true时刹车
+        {
+            //if true the stop every force applied to wheel
+            for (int i = 0; i < frontwheel.Length; ++i)
+            {
+                frontwheel[i].motorTorque = 0;
+                frontwheel[i].brakeTorque = float.MaxValue;
+                CarRb.drag = BrakeDrag;
+                //
+
+            }
+            for (int i = 0; i < rearwheel.Length; ++i)
+            {
+                rearwheel[i].motorTorque = 0;
+                rearwheel[i].brakeTorque = float.MaxValue;
+                //
+                CarRb.drag = BrakeDrag;
+            }
+
+        }
+        else
+        {
+            CarRb.drag = 0.5f; //当drag为0.5，扭矩为300时，稳定速度为8.6m/s
+
+            //if returned false then add force to all wheels
+            for (int i = 0; i < frontwheel.Length; ++i)//给前车轮添加扭矩
+            {
+                frontwheel[i].motorTorque = !Reverse ? EngineTorque : -1000;
+                frontwheel[i].brakeTorque = 0;
+                //CarRb.drag = 1000f;
+                WheelHit wh = new WheelHit();
+                frontwheel[i].GetGroundHit(out wh);
+                if (Mathf.Abs(wh.forwardSlip) >= 1.89f)
+                {
+                    //if foward slip is greater than 1.89f then reduce torque to prevent traction as possible  
+                    if (EngineTorque > 100)
+                        EngineTorque -= 10 * 0.5f;
+                }
+                else
+                {
+                    if (EngineTorque < backengine)
+                    {
+                        EngineTorque += 10 * .5f;
+                        //  vehiclecontroller.forceAppliedToWheels = currentengineforce;
+                    }
+                }
+
+            }
+            for (int i = 0; i < rearwheel.Length; ++i)//给后车轮添加扭矩
+            {
+                rearwheel[i].motorTorque = !Reverse ? EngineTorque : -1000;
+                //
+                rearwheel[i].brakeTorque = 0;
+                
+                WheelHit wh = new WheelHit();
+                rearwheel[i].GetGroundHit(out wh);
+                if (Mathf.Abs(wh.forwardSlip) >= .89f)
+                {
+                    if (EngineTorque > 100)
+                        EngineTorque -= 10 * 0.5f;
+                }
+                else
+                {
+                    if (EngineTorque < backengine)
+                    {
+                        EngineTorque += 10 * .5f;
+                        //  vehiclecontroller.forceAppliedToWheels = currentengineforce;
+                    }
+                }
+
+            }
+        }
+
+    }
+    //
+    public void SteerBalance()//转向平衡
+    {
+        
+        if (Mathf.Abs(newsteer) < 15) return;
+        for (int i = 0; i < frontwheel.Length; i++)
+        {
+            WheelHit wheelhit;
+            frontwheel[i].GetGroundHit(out wheelhit);
+            if (wheelhit.normal == Vector3.zero)
+            {
+                Debug.Log("前轮没有与地面发生碰撞");
+                return;
+            }
+                
+        }
+        for (int i = 0; i < rearwheel.Length; i++)
+        {
+            WheelHit wheelhit;
+            rearwheel[i].GetGroundHit(out wheelhit);
+            if (wheelhit.normal == Vector3.zero)
+            {
+                Debug.Log("后轮没有与地面发生碰撞");
+                return;
+            }
+                
+        }
+        if (Mathf.Abs(OldRot - transform.eulerAngles.y) < 10f)
+        {
+            var alignturn = (transform.eulerAngles.y - OldRot) * SteerBalanceFactor;
+            Quaternion angvelocity = Quaternion.AngleAxis(alignturn, Vector3.up);//计算角速度
+            CarRb.velocity = angvelocity * CarRb.velocity;
+            //Debug.Log("当前车速"+CarRb.velocity.ToString());
+        }
+        OldRot = transform.eulerAngles.y;//记录车辆世界坐标系中的绕y轴的旋转
+    }
+    //
+    private void ApplySteer()
+    {
+        // here the steering functions are applied
+        
+        relativevec = transform.InverseTransformPoint(Tar); //记录目标节点相对于车辆位置的相对坐标
+        LerpToSteerAngle();//实现转向
+
+    }
+    //
+
+    private void UpdateIndividually()
+    {
+        //call when you choose not to update position burst compiler
+        if (!IndividualTracker) return;
+        if (TargetNode != null)
+        {
+            //计算当前车辆距离目标点距离为
+            distToTargetNode = Vector3.Distance(this.transform.position, TargetNode.position);//计算当前车辆位置到目标点的距离
+            
+            if (distToTargetNode < DistanceApart)
+            {
+                
+                if (TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count == 0)
+                {
+                    if (TargetNode.GetComponent<ESNodeManager>().NextNode != null)
+                    {
+                        TargetNode = TargetNode.GetComponent<ESNodeManager>().NextNode;
+                    }
+                    else
+                    {
+                        CancelInvoke();
+                        this.gameObject.SetActive(false);//走完路径被钝化
+
+                    }
+                    optimizerandom = true;
+                }
+                else
+                {
+                    if (TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count > 0)
+                    {
+                        int pathindex = 0;
+                        pathindex = Random.Range(0, TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count);
+                        optimizerandom = false;
+                        TargetNode = TargetNode.GetComponent<ESNodeManager>().ConnectedNode[pathindex];
+                    }
+                }
+            }
+        }
+    }
+    //
+    private void CheckDist()
+    {
+        //updates the nodes of the AI car
+        
+        if (IndividualTracker) return;
+        Debug.Log("检查初始距离:" + distToTargetNode.ToString());
+        if (TargetNode != null)
+        {
+            if (distToTargetNode < DistanceApart)
+            {
+                
+                if (TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count == 0)
+                {
+                    if (TargetNode.GetComponent<ESNodeManager>().NextNode != null)
+                    {
+                        TargetNode = TargetNode.GetComponent<ESNodeManager>().NextNode;
+                    }
+                    else
+                    {
+                        CancelInvoke();
+                        this.gameObject.SetActive(false);
+                        Debug.Log("车辆被取消激活2");
+                    }
+                    optimizerandom = true;
+                }
+                else
+                {
+                    if (TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count > 0)
+                    {
+                        int pathindex = 0;
+                        pathindex = Random.Range(0, TargetNode.GetComponent<ESNodeManager>().ConnectedNode.Count);
+                        optimizerandom = false;
+                        TargetNode = TargetNode.GetComponent<ESNodeManager>().ConnectedNode[pathindex];
+                    }
+                }
+            }
+        }
+    }
+    //
+    //
+    private void LerpToSteerAngle()//实现车辆转向
+    {
+        AvoidPlayer();//躲避AI玩家player
+
+            for (int i = 0; i < frontwheel.Length; i++)
+            {
+                steerang = 3 * Mathf.Atan(relativevec.x / relativevec.z) / Mathf.PI * 180 / (CarRb.velocity.magnitude);//根据下一节点相对于本车的位置确定转向角
+                if (steerang > 0) //限制最大转角，一般车辆最大转向角为30度~40度，此处设为30度
+                    steerang = Mathf.Min(steerang, 30);
+                else
+                    steerang = Mathf.Max(steerang, -30);
+                frontwheel[i].steerAngle = steerang;
+
+            }
+
+        
+    }
+    //
+    private void RegulateAI()
+    {
+        if (player == null) return;
+
+        if (playerdist > SpawnDistance)
+        {
+            CancelInvoke();
+            this.gameObject.SetActive(false);
+            Debug.Log("车辆被取消激活3");
+        }
+    }
+    //
+
+    //
+    
+    private void AvoidPlayer() 
+    {
+        //调用avoid
+        
+        //enables AI Car avoid 
+        if (pedestrianCollider.Count > 0) return;
+        if (UseSmartAvoidMethod == false) return;
+        //start
+        if (!manuever && !isovertaking)
+        {
+            Speedmodifier = 1;
+            Tar = TargetNode.position;
+            //steerang = newsteer;
+            //Debug.Log("转向角设置为0");
+        }
+        //
+        if (TriggerObject != null)
+            TargetHolder = TriggerObject.gameObject; //将与该车碰撞的物体赋值给TargetHolder
+
+        if (TargetHolder != null)
+        {
+            if (TargetHolder.CompareTag("Player"))
+                manuever = true;
+        }
+
+    }
+
+
+
+    private void Behaviour()
+    {
+        CheckForObjectsIncoming();
+        if (DisableSmartAI) return;
+        if (trafficlightctrl == null)
+        {
+            if (triggerobjectbraking)
+            {
+                returnmotor = true;
+            }
+            else
+            {
+                returnmotor = false;
+            }
+            //
+
+            //
+            if (TriggerObject != null)
+            {
+                if (!TriggerObject.gameObject.activeSelf) //如果碰撞物体钝化，则继续前行
+                {
+                    CopySpeed = false;
+                    EnableAvoid = false;
+                    triggerobjectbraking = false;
+                    TriggerObject = null;
+                }
+            }
+            else
+            {
+                triggerobjectbraking = false;
+                dontalterspeed = false;
+            }
+        }
+        else //碰撞物体为信号灯
+        {
+            if (trafficlightctrl.red) //当信号灯红灯开启时，刹车
+            {
+                returnmotor = true;
+            }
+            else //信号灯为绿灯时继续前行
+            {
+                if (triggerobjectbraking)
+                {
+
+                    returnmotor = true;
+                }
+                else
+                {
+                    returnmotor = false;
+                }
+
+            }
+        }
+        //
+        if (TriggerObject != null) //当触碰距离较远时，超出刹车距离，则将碰撞物体移出
+        {
+            float brakedistance = EnableAvoid == false ? RealseBrakeDistance : (overtakedistance + 5f);
+            TriggerDistance = Vector3.Distance(TriggerObject.position, transform.position);
+            
+            if (TriggerDistance > brakedistance) //当碰撞物体超过刹车距离时则继续前行
+            {
+                triggerobjectbraking = false;
+                returntriggerstay = false;
+                CopySpeed = false;
+                EnableAvoid = false;
+                TriggerObject = null; //triggerobject清掉
+            }
+            else
+            {
+                if (!TriggerObject.gameObject.activeSelf) //如果碰撞物体钝化，则继续前行
+                {
+                    triggerobjectbraking = false;
+                    returntriggerstay = false;
+                    CopySpeed = false;
+                    EnableAvoid = false;
+                    TriggerObject = null;
+                }
+            }
+        }
+
+
+        if (!CopySpeed)
+        {
+            if (alignwithroad == false)
+            {
+
+                if (Mathf.Abs(newsteer) > SharpAngleSpeed)
+                {
+                    if (dontalterspeed == false)
+                        topspeed = SharpBendSpeed;
+                }
+                else
+                {
+                    topspeed = backuptopspeed;
+                }
+            }
+        }
+        else
+        {
+            if (TriggerObject != null)
+            {
+                if (TriggerObject.GetComponent<Rigidbody>() != null)
+                {
+                    float Pi = Mathf.PI * 1.15f;
+                    float CurrentSpeed = TriggerObject.GetComponent<Rigidbody>().velocity.magnitude * Pi;
+                    if (currentspeed > 10f)
+                    {
+                        topspeed = !EnableAvoid ? CurrentSpeed * 0.5f : Speedmodifier;
+                        if (TargetNode.GetComponent<ESNodeManager>() != null)
+                            if (TargetNode.GetComponent<ESNodeManager>().OverTakeType == "Right")//右转让行
+                            {
+                                bool DontOverTake = new bool();
+                                if (TriggerObject.GetComponent<ESVehicleAI>() != null)
+                                {
+                                    DontOverTake = TriggerObject.GetComponent<ESVehicleAI>().IgnoreOverTake;
+                                }
+                                if (distToTargetNode > 10 && TargetNode.GetComponent<ESNodeManager>().NextNode != null
+                                && !DontOverTake)
+                                {
+                                    if (vehicleCollider==null)
+                                    {
+                                        EnableAvoid = true;
+
+                                        Vsign = RoadWidth;
+                                    }
+                                }
+
+                            }
+                            else if (TargetNode.GetComponent<ESNodeManager>().OverTakeType == "Left")
+                            {
+                                bool DontOverTake = new bool();
+                                if (TriggerObject.GetComponent<ESVehicleAI>() != null)
+                                {
+                                    DontOverTake = TriggerObject.GetComponent<ESVehicleAI>().IgnoreOverTake;
+                                }
+                                if (distToTargetNode > 10 && TargetNode.GetComponent<ESNodeManager>().NextNode != null
+                                 && !DontOverTake)
+                                {
+                                    if (vehicleCollider == null)
+                                    {
+                                        EnableAvoid = true;
+
+                                        Vsign = -RoadWidth;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                EnableAvoid = false;
+                            }
+
+
+                    }
+                    else
+                    {
+                        triggerobjectbraking = true;
+                    }
+                }
+            }
+        }
+
+    }
+    //
+    public void WheelAlignment() //让车轮轮胎跟上车轮位置
+    {
+        // make tyre meshes follow wheels;
+        if (currentspeed < 0.09f) return;
+        // align front wheel meshes
+        Vector3 frontwheelposition;
+        Quaternion frontwheelrotation;
+        if (frontwheelmeshes.Length > 0)
+        {
+            for (int i = 0; i < frontwheel.Length; i++)
+            {
+                if (frontwheelmeshes[i] == null)
+                {
+                    return;
+                }
+                frontwheel[i].GetWorldPose(out frontwheelposition, out frontwheelrotation);
+                frontwheelmeshes[i].transform.position = frontwheelposition;
+                frontwheelmeshes[i].transform.rotation = frontwheelrotation;
+            }
+        }
+        // align rear wheel meshes
+        Vector3 rearwheelposition;
+        Quaternion rearwheelrotation;
+        if (rearwheelmeshes.Length > 0)
+        {
+            for (int i = 0; i < rearwheel.Length; i++)
+            {
+                if (rearwheelmeshes[i] == null)
+                {
+                    return;
+                }
+                rearwheel[i].GetWorldPose(out rearwheelposition, out rearwheelrotation);
+                rearwheelmeshes[i].transform.position = rearwheelposition;
+                rearwheelmeshes[i].transform.rotation = rearwheelrotation;
+                // Rpm = m_wheelsettings.frontwheels.frontwheelcols[i].rpm;
+            }
+        }
+    }
+    void CheckForObjectsIncoming() //检查前方行人和车辆，若前方行人距离太近，则刹车；若前方车辆太近，则记录碰撞
+    {
+
+        pedestrianCollider = new List<Collider>();
+        vehicleCollider =new List<Collider>();
+        
+        Collider[] hits = Physics.OverlapSphere(this.transform.position, DangerZone); //计算与该车辆位于dangerzone范围内的碰撞体
+        if (hits.Length > 0)
+        {
+            for (int i = 0; i < hits.Length; ++i)
+            {
+                if (hits[i].attachedRigidbody != null)
+                {
+                    if (hits[i].attachedRigidbody.transform != this.transform)
+                    {
+                        if (hits[i].attachedRigidbody.transform.CompareTag("Pedestrian") && hits[i].gameObject.activeInHierarchy == true) //保证行人是没有被关掉才能加入
+                        {
+
+                            Vector3 fwd = transform.forward;
+                            Vector3 rgt = transform.right;
+
+                            Vector3 Aiposition = hits[i].transform.position - transform.position;
+                            hitfwd = Vector3.Dot(fwd, Aiposition);
+                            hitsidedis = Mathf.Abs(Vector3.Dot(rgt, Aiposition));
+                            if (hitfwd > 0 && hitsidedis < sidesensor && hitfwd < 10) //如果行人在前方且侧方距离过近则加入预判碰撞组
+
+                                pedestrianCollider.Add(hits[i]);//当碰撞AI物体在车辆前方，那么则加入_collider数组
+                        }
+                        if (hits[i].gameObject.CompareTag("AIVehicle") && hits[i].gameObject.activeInHierarchy == true) //保证车辆是没有被关掉才能加入
+                        {
+                                vehicleCollider.Add(hits[i]);//当碰撞AI物体在车辆前方，那么则加入_collider数组
+                        }
+
+                    }
+                }
+            }
+
+        }
+        if (pedestrianCollider.Count > 0)
+        {
+            returnmotor = true;
+            CarRb.drag = 50f;
+        }
+        
+
+        if (vehicleCollider !=null)
+        {
+            int crashCount = 0;
+            ifWillCrash = false;
+            for (int i=0;i< vehicleCollider.Count;i++)
+            {
+               
+                ESVehicleAI thisVeh = GetComponent<ESVehicleAI>();
+                ESVehicleAI otherVeh = vehicleCollider[i].GetComponent<ESVehicleAI>();
+                Transform selfTargetNode = thisVeh.TargetNode;
+                Transform otherTargetNode = otherVeh.TargetNode;
+                
+                if (selfTargetNode != null && otherTargetNode != null) //目标节点都存在
+                {
+                    Vector3 selfTargetPosition = selfTargetNode.position;//获取目标节点坐标;
+
+                    Vector3 otherTargetPositon = otherTargetNode.position;//获取预判车辆目标节点
+                    selfPriority = selfTargetNode.GetComponent<ESNodeManager>().priorityCount; //判断自己和对方车辆优先级
+                    int otherPriority = otherTargetNode.GetComponent<ESNodeManager>().priorityCount; //判断自己和对方车辆优先级
+                    if ( PredictCrash(thisVeh,otherVeh,selfPriority,otherPriority)==true)//判断是否有相撞可能
+                    {
+                       crashCount +=1;
+                    }
+                }
+            }
+            if (crashCount>0)
+            {
+                ifWillCrash = true;
+                returnmotor = true;
+                CarRb.drag = 50f;
+            }
+        }
+    }
+    
+    // 
+    //
+    void OnTriggerEnter(Collider Other) //当发生碰撞时触发，碰撞对象可能是信号灯、车辆等
+    {
+        if (Other.CompareTag("TrafficLight"))
+        {
+            //trafficlight ahead
+            if (Other.transform.GetComponent<ESTrafficLghtCtrl>() != null)
+                trafficlightctrl = Other.transform.GetComponent<ESTrafficLghtCtrl>();
+            if (Other.transform.root.GetComponent<ESTrafficLghtCtrl>() != null)
+                trafficlightctrl = Other.transform.root.GetComponent<ESTrafficLghtCtrl>();
+            if (Other.transform.parent.GetComponent<ESTrafficLghtCtrl>() != null)
+                trafficlightctrl = Other.transform.parent.GetComponent<ESTrafficLghtCtrl>();
+
+            if (trafficlightctrl != null)
+            {
+                trafficlightctrl.LastVeh = this.transform; //将经过信号灯的车辆赋值给信号灯
+            }
+        }
+        //
+        if (Other.transform.root.name == "AI" || Other.transform.CompareTag("Player")||Other.CompareTag ("Pedestrian") ) //车辆与其他非信号灯碰撞时触发，包括玩家，AI汽车和行人
+        {
+            if (TriggerObject == null)
+            {
+                Vector3 fwd = transform.TransformDirection(Vector3.forward);
+                Vector3 playerpositon = Other.transform.position - transform.position;
+                fwddot = Vector3.Dot(fwd, playerpositon); //计算碰撞车辆在本车辆正前方的距离
+                //
+                Vector3 swd = transform.TransformDirection(Vector3.right);//本车辆的右侧转换成世界坐标
+                Vector3 playersidepositon = Other.transform.position - transform.position;
+                side = Vector3.Dot(swd, playersidepositon); //计算碰撞车辆在本车辆的哪一侧，正为右侧负为左侧
+                if (DisableSmartAI == false)
+                {
+                    if (fwddot > fowardsensor && Mathf.Abs(side) < sidesensor) //车辆在前方距离较远但侧方较近
+                    {
+                        TriggerObject = Other.attachedRigidbody == null ? Other.transform : Other.attachedRigidbody.transform;//将碰撞物体赋值给triggerobject
+                        if (TriggerObject.GetComponent<Rigidbody>() != null)
+                        {
+
+                            float Pi = Mathf.PI * 1.15f; //速度m/s转换成时速km/h?
+                            float CurrentSpeed = TriggerObject.GetComponent<Rigidbody>().velocity.magnitude * Pi;//跟车模型
+                            if (CurrentSpeed > 10f) //碰撞物体时速超过10km/h，不减速
+                            {
+                                CopySpeed = true;
+                                topspeed = CurrentSpeed * 0.5f;//汽车速度降低到碰撞物体的一半速度
+                            }
+                            else //碰撞物体时速超过10km/h时，减速
+                            {
+                                if (!CopySpeed)
+                                {
+                                    //Debug.Log(gameObject.name + "停止");
+                                    triggerobjectbraking = true;
+                                    returnmotor = true;
+                                    CarRb.drag = 50f;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (!CopySpeed)
+                            {
+                                triggerobjectbraking = true;
+                                returnmotor = true;
+                                CarRb.drag = 50f;
+                            }
+                        }
+                    }
+                    
+                }
+            }
+        }
+        //
+        
+
+        callsensor = true;
+    }
+
+
+
+
+    void InvokeRemovePlayer() 
+    {
+        //Debug.Log("invokeremoveplayer被执行");
+        if (TriggerObject == null)
+        {
+            CancelInvoke();
+            return;
+        }
+        distToTriggerobject = Vector3.Distance(TriggerObject.position, this.transform.position);
+        if (distToTriggerobject > 6) //当碰撞物体远离本车辆距离超过6m时，将triggerobject设为null，继续前行
+        {
+            
+            //Debug.Log("距离前方车辆发动距离："+distToTriggerobject.ToString ());
+            triggerobjectbraking = false;
+            CopySpeed = false;
+            EnableAvoid = false;
+            TriggerObject = null;
+
+        }
+    }
+    //
+    //
+    void OnTriggerExit(Collider Other)
+    {
+        //
+        if (TriggerObject != null)
+        {
+           
+            //Debug.Log("invokeremoveplayer被执行");
+            CancelInvoke();
+            InvokeRepeating("InvokeRemovePlayer", 0.1f, 0.1f);
+
+            
+        }
+        trafficlightctrl = null;
+        callsensor = false;
+        Stop = false;
+    }
+    private bool PredictCrash(ESVehicleAI thisVeh, ESVehicleAI otherVeh, int selfPriority,int otherPriority)//判断是否车辆沿轨迹是否会发生碰撞
+    {
+        bool willCrash = false;
+        Transform otherPath; //记录对面车辆路径
+        Transform thisPath; //记录对面车辆路径
+        
+        GameObject[] thisCrashPath=thisVeh.GetComponent<DistanceToCrashPoint>().crashPath; //记录本车辆可能与之碰撞的路径
+        GameObject[] otherCrashPath=otherVeh.GetComponent<DistanceToCrashPoint>().crashPath; //记录本车辆可能与之碰撞的路径
+        otherPath = otherVeh.GetComponent<DistanceToCrashPoint>().path;
+        thisPath=thisVeh.GetComponent<DistanceToCrashPoint>().path;
+        if (thisCrashPath!=null)
+        {
+            for (int i = 0; i < thisCrashPath.Length; i++)
+            {
+                if (otherPath.name == thisCrashPath[i].name)
+                {
+                    float thisDistToCrashPoint = thisVeh.GetComponent<DistanceToCrashPoint>().disToCrashPoint[i];
+                    float otherDistToCrashPoint=0;
+                    for (int j=0; j<otherCrashPath.Length;j++)
+                    {
+                        if(otherCrashPath[j].name== thisPath.name)
+                        {
+                            otherDistToCrashPoint = otherVeh.GetComponent<DistanceToCrashPoint>().disToCrashPoint[j];
+                            break;
+                        }
+                            
+                    }
+                    if (thisDistToCrashPoint > -5 && otherDistToCrashPoint > -5&& otherVeh.vehicleVelocity>0.1f) //-3为离开冲突区域保险距离
+                    {
+                        float timeDifference = otherDistToCrashPoint / otherVeh.maxVehicleSpeed - thisDistToCrashPoint / thisVeh.maxVehicleSpeed;
+                        if (Mathf.Abs(timeDifference) < 3f) //时间差少于3s则认为相撞，当本车辆距离碰撞点过近(离碰撞点3m范围)时，则己方先行
+                        {
+                            if (selfPriority > otherPriority )//当己方优先级低于对方优先级
+                            {
+                                if (thisDistToCrashPoint > 6f && thisDistToCrashPoint <= 10) //如果己方车辆没有越过6m停车线，且到达距离碰撞点10m范围，停车
+                                {
+                                    willCrash = true;
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                if (otherDistToCrashPoint < 6f) //对方车辆越过停车线，则自己优先级较高时也要避让
+                                {
+                                    willCrash = true;
+                                    break;
+                                }
+                            }
+ 
+                       }
+
+                                
+                    }
+                            
+                 }
+                }
+
+        }
+        return willCrash;
+
+
+    }
+
+}
